@@ -1,0 +1,1 @@
+savedcmd_/home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/procesos/procesos.mod := printf '%s\n'   procesos.o | awk '!x[$$0]++ { print("/home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/procesos/"$$0) }' > /home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/procesos/procesos.mod

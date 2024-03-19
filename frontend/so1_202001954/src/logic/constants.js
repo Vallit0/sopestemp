@@ -1,0 +1,1 @@
+export let basePythonUrl = 'http://load-balancer-674194917.us-east-1.elb.amazonaws.com'
