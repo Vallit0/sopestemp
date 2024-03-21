@@ -1,1 +1,1 @@
-savedcmd_/home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/cpu/modules.order := {   echo /home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/cpu/cpu_so1_1s2024.o; :; } > /home/vallito/Desktop/newSopes/SO1_1S2024_202001954/Proyecto1/proc_modules/cpu/modules.order
+savedcmd_/home/vallito/Desktop/sopes/proc_modules/cpu/modules.order := {   echo /home/vallito/Desktop/sopes/proc_modules/cpu/cpu_so1_1s2024.o; :; } > /home/vallito/Desktop/sopes/proc_modules/cpu/modules.order

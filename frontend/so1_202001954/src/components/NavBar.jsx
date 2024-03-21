@@ -9,7 +9,7 @@ export function NavBar({ currentUser }) {
 
     const handleLogout = () => {
         localStorage.removeItem('user');
-        window.location.href = "/login"
+        window.location.href = "/"
     }
 
     NavBar.propTypes = {
@@ -28,7 +28,7 @@ export function NavBar({ currentUser }) {
                         style={{ maxHeight: '100px' }}
                         navbarScroll
                     >
-                        <Nav.Link href="/init">Datos Historicos</Nav.Link>
+                        <Nav.Link href="/historical">Datos Historicos</Nav.Link>
                         <Nav.Link href="/tree">Arbol de Procesos</Nav.Link>
                         <Nav.Link href="/emulator">Emulator</Nav.Link>
 

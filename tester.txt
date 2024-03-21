@@ -14,7 +14,7 @@ services:
       - mysqlvol:/var/lib/mysql
 
   backend:
-    image: vallit01/nbackend:latest
+    image: stvnru/backend:latest
     hostname: backend
     pid: host
     restart: always
@@ -26,14 +26,14 @@ services:
       - "8080:8080"
     depends_on:
       - db
+
   frontend:
-    image: vallit01/nfrontend:latest
+    image: stvnru/frontend:latest
     restart: always
     ports:
       - "80:80"
     depends_on:
       - backend
-
 
 volumes:
   mysqlvol:

@@ -1,338 +1,464 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 )
 
-type ramStruct struct {
-	TotalRam      uint64
-	RamEnUso      uint64
-	RamLibre      uint64
-	PorcentajeUso uint64
+type Process struct {
+	PID      int        `json:"pid"`
+	Name     string     `json:"name"`
+	User     int        `json:"user,omitempty"`
+	State    int        `json:"state"`
+	RAM      int        `json:"ram"`
+	Children []*Process `json:"child,omitempty"`
+}
+type MemHistorico struct {
+	FechaHora  string `json:"fechaHora"`
+	MemoriaRAM int    `json:"memoriaRAM"`
+	CPU        int    `json:"cpu"`
+}
+type Response struct {
+	Message string `json:"message"`
+	PID     int    `json:"pid,omitempty"`
 }
 
-type responseKill struct {
-	Pid int
+var process *exec.Cmd
+
+// Estructura para representar el conjunto de procesos
+type ProcessTree struct {
+	CPUTotal      int        `json:"cpu_total"`
+	CPUPorcentaje int        `json:"cpu_porcentaje"`
+	Processes     []*Process `json:"processes"`
+	Running       int        `json:"running"`
+	Sleeping      int        `json:"sleeping"`
+	Zombie        int        `json:"zombie"`
+	Stopped       int        `json:"stopped"`
+	Total         int        `json:"total"`
 }
 
-func ramAdmin(w http.ResponseWriter, _ *http.Request) {
-	cmd := exec.Command("sh", "-c", "cat /proc/ram_202001954")
+func main() {
+	go ejecutarCada5Segundos()
 
-	salida, err := cmd.CombinedOutput()
+	crearTabla()
+	router := mux.NewRouter()
 
-	if err != nil {
-		log.Fatalln(err)
-	}
-	fmt.Println("------------------------------")
-	fmt.Println("Running command: ", cmd.String())
-	fmt.Println(string(salida))
-	fmt.Println("------------------------------")
+	// router.HandleFunc("/users", getUsers).Methods("GET")
+	router.HandleFunc("/api/data", statusMemory).Methods("GET")
+	router.HandleFunc("/api/processes", getProcesos).Methods("GET")
+	router.HandleFunc("/api/historico", historicoMemory).Methods("GET")
 
-	ramAtributos := strings.Split(string(salida), ",")
-	ramStr := ramStruct{}
-	for _, atributos := range ramAtributos {
-		atri := strings.Split(string(atributos), ":")
+	router.HandleFunc("/api/start", StartProcess).Methods("GET")
+	router.HandleFunc("/api/stop", StopProcess).Methods("GET")
+	router.HandleFunc("/api/resume", ResumeProcess).Methods("GET")
+	router.HandleFunc("/api/kill", KillProcess).Methods("GET")
 
-		if atri[0] == "TotRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			ramStr.TotalRam = u64
-		} else if atri[0] == "UseRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			ramStr.RamEnUso = u64
-		} else if atri[0] == "FreRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			ramStr.RamLibre = u64
-		} else if atri[0] == "PorRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			ramStr.PorcentajeUso = u64
-		}
+	// Configuración de CORS
+	c := cors.AllowAll()
 
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	jsonResp, err := json.Marshal(ramStr)
-	if err != nil {
-		log.Fatalf("Error happened in JSON marshal. Err: %s", err)
-	}
-	w.Write(jsonResp)
-	return
+	// Handler con CORS habilitado
+	handler := c.Handler(router)
+
+	fmt.Println("Server listening on port 8080...")
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
+func crearTabla() {
+	// Cadena de conexión a la base de datos
+	dataSourceName := "user:pass@tcp(db:3306)/memories"
 
-func cpuAdmin(w http.ResponseWriter, _ *http.Request) {
-	cmd := exec.Command("sh", "-c", "cat /proc/cpu_202001954")
-
-	salida, err := cmd.CombinedOutput()
-
+	// Abre una conexión a la base de datos MySQL
+	db, err := sql.Open("mysql", dataSourceName)
 	if err != nil {
-		log.Fatalln(err)
+		panic(err.Error())
+	}
+	defer db.Close()
+
+	// Ejecuta una sentencia SQL para crear la tabla memHistorico
+	_, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS memHistorico (
+            fechaHora TIMESTAMP,
+            memoria_ram INT,
+            cpu INT
+        );
+    `)
+	if err != nil {
+		panic(err.Error())
 	}
 
-	var a []interface{}
-	err = json.Unmarshal(salida, &a)
-
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	jsonResp, err := json.Marshal(a)
-	if err != nil {
-		log.Fatalf("Error happened in JSON marshal. Err: %s", err)
-	}
-	w.Write(jsonResp)
-	return
+	fmt.Println("La tabla memHistorico se ha creado correctamente.")
 }
-
-func cpuUso(w http.ResponseWriter, _ *http.Request) {
-	var prevIdleTime, prevTotalTime uint64
-	var cpuUsage float64
-	for i := 0; i < 2; i++ {
-		file, err := os.Open("/proc/stat")
-		if err != nil {
-			log.Fatal(err)
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Scan()
-		firstLine := scanner.Text()[5:] // get rid of cpu plus 2 spaces
-		file.Close()
-		if err := scanner.Err(); err != nil {
-			log.Fatal(err)
-		}
-		split := strings.Fields(firstLine)
-		idleTime, _ := strconv.ParseUint(split[3], 10, 64)
-		totalTime := uint64(0)
-		for _, s := range split {
-			u, _ := strconv.ParseUint(s, 10, 64)
-			totalTime += u
-		}
-		if i > 0 {
-			deltaIdleTime := idleTime - prevIdleTime
-			deltaTotalTime := totalTime - prevTotalTime
-			cpuUsage = (1.0 - float64(deltaIdleTime)/float64(deltaTotalTime)) * 100.0
-		}
-		prevIdleTime = idleTime
-		prevTotalTime = totalTime
-		time.Sleep(time.Second)
-	}
-
-	data := make(map[string]any)
-	data["cpu"] = cpuUsage
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	jsonResp, err := json.Marshal(data)
+func statusMemory(w http.ResponseWriter, r *http.Request) {
+	// Generar datos aleatorios para la memoria RAM y la CPU
+	totalUsed, total, err := getRAMInfo()
 	if err != nil {
-		log.Fatalf("Error happened in JSON marshal. Err: %s", err)
-	}
-	w.Write(jsonResp)
-	return
-}
-
-func kill(w http.ResponseWriter, r *http.Request) {
-
-	b, err := io.ReadAll(r.Body)
-	if err != nil {
-		panic(err)
-	}
-	var data = []byte(b)
-	var kil responseKill
-	err = json.Unmarshal(data, &kil)
-
-	pid := kil.Pid
-
-	proceso, err := os.FindProcess(pid)
-	if err != nil {
-		fmt.Printf("Error al obtener el proceso: %v\n", err)
+		fmt.Println("Error:", err)
 		return
 	}
 
-	if err := proceso.Signal(syscall.SIGKILL); err != nil {
-		fmt.Printf("Error al enviar la señal SIGKILL: %v\n", err)
+	totalCpu, cpuUsage, err := obtenerCPUInfo()
+	if err != nil {
+		fmt.Println("Error:", err)
 		return
 	}
 
-	fmt.Printf("Proceso con PID %d terminado correctamente.\n", pid)
+	ramData := int((totalUsed * 100) / total)
+
+	cpuData := int((totalCpu * 100) / cpuUsage)
+	fmt.Println("RAM:", ramData, "CPU:", cpuData)
+	// Crear un mapa para almacenar los datos
+	data := map[string]int{
+		"ram": ramData,
+		"cpu": cpuData,
+	}
+
+	// Establecer el encabezado Content-Type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Convertir y enviar los datos como JSON en la respuesta
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		http.Error(w, "Error al enviar los datos como JSON", http.StatusInternalServerError)
+		return
+	}
+}
+
+func getProcesos(w http.ResponseWriter, r *http.Request) {
+	data, erri := ioutil.ReadFile("/proc/cpu_so1_1s2024")
+	if erri != nil {
+		return
+	}
+
+	// Convertir los datos a string
+	content := string(data)
+	// Decodificar los datos JSON en una estructura ProcessTree
+	var processTree ProcessTree
+	if err := json.Unmarshal([]byte(content), &processTree); err != nil {
+		fmt.Println("Error al decodificar JSON:", err)
+		return
+	}
+	procesos := processTree.Processes
+	// Establecer el encabezado Content-Type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Convertir y enviar los datos como JSON en la respuesta
+	if err := json.NewEncoder(w).Encode(procesos); err != nil {
+		http.Error(w, "Error al enviar los datos como JSON", http.StatusInternalServerError)
+		return
+	}
+}
+
+func historicoMemory(w http.ResponseWriter, r *http.Request) {
+	// Establecer el encabezado Content-Type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Obtener los datos de la base de datos
+	jsonData, err := verInserciones()
+	if err != nil {
+		http.Error(w, "Error al obtener los datos de la base de datos", http.StatusInternalServerError)
+		log.Fatal(err)
+		return
+	}
+
+	// Deserializar jsonData en una slice de MemHistorico
+	var historico []MemHistorico
+	if err := json.Unmarshal(jsonData, &historico); err != nil {
+		http.Error(w, "Error al deserializar los datos JSON", http.StatusInternalServerError)
+		log.Fatal(err)
+		return
+	}
+
+	// Enviar la slice de MemHistorico como respuesta
+	if err := json.NewEncoder(w).Encode(historico); err != nil {
+		http.Error(w, "Error al enviar los datos como JSON", http.StatusInternalServerError)
+		log.Fatal(err)
+		return
+	}
+}
+
+// -------------------------------------------------------------- Procesos
+func StartProcess(w http.ResponseWriter, r *http.Request) {
+	cmd := exec.Command("sleep", "infinity")
+	err := cmd.Start()
+	if err != nil {
+		http.Error(w, "Error al iniciar el proceso", http.StatusInternalServerError)
+		return
+	}
+
+	process = cmd
+
+	response := Response{
+		Message: "Proceso iniciado",
+		PID:     process.Process.Pid,
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	dat := make(map[string]any)
-	dat["code"] = 200
-	jsonResp, err := json.Marshal(dat)
+	json.NewEncoder(w).Encode(response)
+}
+func StopProcess(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.URL.Query().Get("pid")
+	if pidStr == "" {
+		http.Error(w, "Se requiere el parámetro 'pid'", http.StatusBadRequest)
+		return
+	}
+
+	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
-		log.Fatalf("Error happened in JSON marshal. Err: %s", err)
+		http.Error(w, "El parámetro 'pid' debe ser un número entero", http.StatusBadRequest)
+		return
 	}
-	w.Write(jsonResp)
-	return
-}
 
-type CpuStruct struct {
-	PorcentajeUso uint64 `json:"porcentajeUso"`
-}
-
-var db *sql.DB
-
-// inicializar la base de datos
-func initDB() {
-	var err error
-	db, err = sql.Open("mysql", "root:1234@tcp(127.0.0.1:3306)/monitor")
+	cmd := exec.Command("kill", "-SIGSTOP", strconv.Itoa(pid))
+	err = cmd.Run()
 	if err != nil {
-		log.Fatalf("Error al abrir la base de datos: %v", err)
+		http.Error(w, fmt.Sprintf("Error al detener el proceso con PID %d", pid), http.StatusInternalServerError)
+		return
 	}
 
-	if err = db.Ping(); err != nil {
-		log.Fatalf("Error al conectar con la base de datos: %v", err)
+	response := Response{
+		Message: fmt.Sprintf("Proceso con PID %d detenido", pid),
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
+func ResumeProcess(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.URL.Query().Get("pid")
+	if pidStr == "" {
+		http.Error(w, "Se requiere el parámetro 'pid'", http.StatusBadRequest)
+		return
+	}
 
-// / Obtener solamente RAM
-func getRAMUsage() (ramStruct, error) {
-	cmd := exec.Command("sh", "-c", "cat /proc/ram_202001954")
-
-	salida, err := cmd.CombinedOutput()
+	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
-		return ramStruct{}, fmt.Errorf("error al ejecutar el comando: %w", err)
+		http.Error(w, "El parámetro 'pid' debe ser un número entero", http.StatusBadRequest)
+		return
 	}
 
-	fmt.Println("------------------------------")
-	fmt.Println("Running command: ", cmd.String())
-	fmt.Println(string(salida))
-	fmt.Println("------------------------------")
-
-	ramAtributos := strings.Split(string(salida), ",")
-	ramStr := ramStruct{}
-	for _, atributos := range ramAtributos {
-		atri := strings.Split(string(atributos), ":")
-
-		if atri[0] == "TotRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				return ramStruct{}, fmt.Errorf("error al parsear TotRam: %w", err)
-			}
-			ramStr.TotalRam = u64
-		} else if atri[0] == "UseRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				return ramStruct{}, fmt.Errorf("error al parsear UseRam: %w", err)
-			}
-			ramStr.RamEnUso = u64
-		} else if atri[0] == "FreRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				return ramStruct{}, fmt.Errorf("error al parsear FreRam: %w", err)
-			}
-			ramStr.RamLibre = u64
-		} else if atri[0] == "PorRam" {
-			u64, err := strconv.ParseUint(atri[1], 10, 64)
-			if err != nil {
-				return ramStruct{}, fmt.Errorf("error al parsear PorRam: %w", err)
-			}
-			ramStr.PorcentajeUso = u64
-		}
+	cmd := exec.Command("kill", "-SIGCONT", strconv.Itoa(pid))
+	err = cmd.Run()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error al reanudar el proceso con PID %d", pid), http.StatusInternalServerError)
+		return
 	}
 
-	return ramStr, nil
+	response := Response{
+		Message: fmt.Sprintf("Proceso con PID %d reanudado", pid),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+func KillProcess(w http.ResponseWriter, r *http.Request) {
+	pidStr := r.URL.Query().Get("pid")
+	if pidStr == "" {
+		http.Error(w, "Se requiere el parámetro 'pid'", http.StatusBadRequest)
+		return
+	}
+
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		http.Error(w, "El parámetro 'pid' debe ser un número entero", http.StatusBadRequest)
+		return
+	}
+
+	cmd := exec.Command("kill", "-9", strconv.Itoa(pid))
+	err = cmd.Run()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error al intentar terminar el proceso con PID %d", pid), http.StatusInternalServerError)
+		return
+	}
+
+	response := Response{
+		Message: fmt.Sprintf("Proceso con PID %d ha terminado", pid),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
-// // Obtener solamente CPU
-func getCpuUsage() (float64, error) {
-	var prevIdleTime, prevTotalTime uint64
-	var cpuUsage float64
-	for i := 0; i < 2; i++ {
-		file, err := os.Open("/proc/stat")
+// ----------------------------------------------------------------------
+
+func ejecutarCada5Segundos() {
+	for {
+		// Ejecutar tu código cada 5 segundos
+		totalUsed, total, err := getRAMInfo()
 		if err != nil {
-			return 0, fmt.Errorf("error al abrir /proc/stat: %w", err)
+			fmt.Println("Error:", err)
+			return
 		}
-		scanner := bufio.NewScanner(file)
-		scanner.Scan()
-		firstLine := scanner.Text()[5:] // eliminar 'cpu' y dos espacios
-		file.Close()
-		if err := scanner.Err(); err != nil {
-			return 0, fmt.Errorf("error al leer /proc/stat: %w", err)
-		}
-		split := strings.Fields(firstLine)
-		idleTime, err := strconv.ParseUint(split[3], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("error al parsear idleTime: %w", err)
-		}
-		totalTime := uint64(0)
-		for _, s := range split {
-			u, err := strconv.ParseUint(s, 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("error al parsear totalTime: %w", err)
-			}
-			totalTime += u
-		}
-		if i > 0 {
-			deltaIdleTime := idleTime - prevIdleTime
-			deltaTotalTime := totalTime - prevTotalTime
-			cpuUsage = (1.0 - float64(deltaIdleTime)/float64(deltaTotalTime)) * 100.0
-		}
-		prevIdleTime = idleTime
-		prevTotalTime = totalTime
-		time.Sleep(time.Second)
-	}
 
-	return cpuUsage, nil
+		totalCpu, cpuUsage, err := obtenerCPUInfo()
+		if err != nil {
+			fmt.Println("Error:", err)
+			return
+		}
+
+		ramData := int((totalUsed * 100) / total)
+		cpuData := int((cpuUsage * 100) / totalCpu)
+
+		erri := insertarDatos(time.Now(), ramData, cpuData)
+		if erri != nil {
+			log.Fatal(err)
+		}
+
+		// Esperar 5 segundos antes de la próxima ejecución
+		time.Sleep(5 * time.Second)
+	}
 }
 
-// / insercio de datos
-func insertResourceUsage(usoCPU float64, usoRAM float64) error {
-	// La consulta SQL para insertar los datos en la base de datos.
-	query := "INSERT INTO registro_uso_recursos (uso_cpu, uso_ram) VALUES (?, ?)"
+func verInserciones() ([]byte, error) {
+	// Cadena de conexión a la base de datos
+	connectionString := "user:pass@tcp(db:3306)/memories"
+	// Reemplaza usuario, contraseña, puerto y nombre_de_la_base_de_datos con los valores correctos
 
-	// Preparar la consulta SQL para ejecución
-	stmt, err := db.Prepare(query)
+	// Abre la conexión a la base de datos
+	db, err := sql.Open("mysql", connectionString)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	// Prepara la consulta SQL para seleccionar todos los registros de la tabla
+	rows, err := db.Query("SELECT fechaHora, memoria_ram, cpu FROM memHistorico")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Crea una slice de MemHistorico para almacenar los resultados
+	var resultados []MemHistorico
+
+	// Itera sobre los resultados y almacena cada registro en la slice
+	for rows.Next() {
+		var m MemHistorico
+		if err := rows.Scan(&m.FechaHora, &m.MemoriaRAM, &m.CPU); err != nil {
+			return nil, err
+		}
+		resultados = append(resultados, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Serializa la slice de MemHistorico a JSON
+	jsonData, err := json.Marshal(resultados)
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonData, nil
+}
+
+func getRAMInfo() (uint64, uint64, error) {
+	// Leer el archivo /proc/ram_so1_1s2024
+	data, err := ioutil.ReadFile("/proc/ram_so1_1s2024")
+	if err != nil {
+		return 0, 0, fmt.Errorf("error al leer el archivo: %v", err)
+	}
+
+	// Convertir los datos en string
+	content := string(data)
+
+	// Dividir el contenido en líneas
+	lines := strings.Split(content, "\n")
+
+	// Si hay al menos dos líneas (total usado y total)
+	if len(lines) >= 2 {
+		// Convertir las líneas a uint64
+		totalUsed, err := strconv.ParseUint(lines[0], 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("error al convertir el total usado: %v", err)
+		}
+		total, err := strconv.ParseUint(lines[1], 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("error al convertir el total: %v", err)
+		}
+
+		return totalUsed, total, nil
+	}
+
+	return 0, 0, fmt.Errorf("no se pudo leer correctamente el archivo")
+}
+
+func obtenerCPUInfo() (int, int, error) {
+	var cpuTotal, cpuPorcentaje int
+
+	// Leer el contenido del archivo /proc/cpu_so1_1s2024
+	data, err := ioutil.ReadFile("/proc/cpu_so1_1s2024")
+	if err != nil {
+		return 0, 0, fmt.Errorf("error al leer el archivo: %v", err)
+	}
+
+	// Convertir los datos a string
+	content := string(data)
+
+	// Buscar la posición inicial de "processes":[
+	startIndex := strings.Index(content, "\"processes\":[")
+	if startIndex == -1 {
+		return 0, 0, fmt.Errorf("no se encontró la sección \"processes\":[ en el archivo")
+	}
+
+	// Extraer las líneas antes de "processes":[
+	desiredLines := content[:startIndex]
+
+	// Buscar la posición inicial de "cpu_total":
+	cpuTotalIndex := strings.LastIndex(desiredLines, "\"cpu_total\":")
+	if cpuTotalIndex == -1 {
+		return 0, 0, fmt.Errorf("no se encontró la clave \"cpu_total\" en el archivo")
+	}
+	// Obtener el valor de "cpu_total"
+	_, err = fmt.Sscanf(desiredLines[cpuTotalIndex:], "\"cpu_total\":%d,", &cpuTotal)
+	if err != nil {
+		return 0, 0, fmt.Errorf("error al leer el valor de \"cpu_total\": %v", err)
+	}
+
+	// Buscar la posición inicial de "cpu_porcentaje":
+	cpuPorcentajeIndex := strings.LastIndex(desiredLines, "\"cpu_porcentaje\":")
+	if cpuPorcentajeIndex == -1 {
+		return 0, 0, fmt.Errorf("no se encontró la clave \"cpu_porcentaje\" en el archivo")
+	}
+	// Obtener el valor de "cpu_porcentaje"
+	_, err = fmt.Sscanf(desiredLines[cpuPorcentajeIndex:], "\"cpu_porcentaje\":%d,", &cpuPorcentaje)
+	if err != nil {
+		return 0, 0, fmt.Errorf("error al leer el valor de \"cpu_porcentaje\": %v", err)
+	}
+
+	return cpuTotal, cpuPorcentaje, nil
+}
+
+func insertarDatos(fechaHora time.Time, memoriaRAM int, cpu int) error {
+	// Cadena de conexión a la base de datos
+	connectionString := "user:pass@tcp(db:3306)/memories"
+
+	// Abre la conexión a la base de datos
+	db, err := sql.Open("mysql", connectionString)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// Prepara la sentencia SQL para insertar datos en la tabla
+	stmt, err := db.Prepare("INSERT INTO memHistorico(fechaHora, memoria_ram, cpu) VALUES(?,?,?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	// Ejecutar la consulta con los valores proporcionados
-	_, err = stmt.Exec(usoCPU, usoRAM)
+	// Ejecuta la sentencia SQL con los valores proporcionados
+	_, err = stmt.Exec(fechaHora, memoriaRAM, cpu)
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
-
-func main() {
-	initDB()
-	defer db.Close()
-
-	http.HandleFunc("/ram", ramAdmin)  // Manejador para uso de RAM
-	http.HandleFunc("/cpu", cpuAdmin)  // Manejador para uso de CPU
-	http.HandleFunc("/cpuUso", cpuUso) // Manejador para obtener el porcentaje de uso de CPU
-	http.HandleFunc("/kill", kill)     // Manejador para terminar un proceso
-
-	log.Println("Servidor iniciado en http://localhost:8000")
-	if err := http.ListenAndServe(":8000", nil); err != nil {
-		log.Fatalf("Error al iniciar el servidor: %v", err)
-	}
-}
-
-// te amo karlita onichan uwu
